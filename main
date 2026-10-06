@@ -1,1 +1,490 @@
 
+import asyncio
+import logging
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, BusinessConnection, BusinessMessagesDeleted, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.filters import CommandStart
+from aiogram.enums import ParseMode
+import aiosqlite
+from datetime import datetime, timedelta
+
+BOT_TOKEN = "8932026304:AAExp1w7hGxZCIJt3QS1Np6Gd0iUXEjHUH4"
+BOT_USERNAME = "Shssyey_bot"
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+DB_PATH = "spy.db"
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                connection_id TEXT,
+                chat_id INTEGER,
+                message_id INTEGER,
+                text TEXT,
+                file_id TEXT,
+                file_type TEXT,
+                from_user_id INTEGER,
+                from_user_name TEXT,
+                date TEXT,
+                PRIMARY KEY (connection_id, chat_id, message_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS connections (
+                connection_id TEXT PRIMARY KEY,
+                user_id INTEGER
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                connection_id TEXT,
+                chat_id INTEGER,
+                chat_title TEXT,
+                last_activity TEXT,
+                delete_at TEXT,
+                PRIMARY KEY (connection_id, chat_id)
+            )
+        """)
+
+        try:
+            await db.execute("ALTER TABLE messages ADD COLUMN from_user_id INTEGER")
+        except:
+            pass
+        try:
+            await db.execute("ALTER TABLE messages ADD COLUMN from_user_name TEXT")
+        except:
+            pass
+        try:
+            await db.execute("ALTER TABLE messages ADD COLUMN date TEXT")
+        except:
+            pass
+        try:
+            await db.execute("ALTER TABLE chats ADD COLUMN delete_at TEXT")
+        except:
+            pass
+
+        await db.commit()
+
+@dp.message(CommandStart())
+async def start(msg: Message):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟢 Ulash", url="tg://settings/edit")],
+        [InlineKeyboardButton(text="🗑 O‘chirilgan chatlarim", callback_data="deleted_chats")],
+        [InlineKeyboardButton(text="▶️ Bot qanday ishlaydi?", callback_data="how_it_works")]
+    ])
+
+    text = (
+        "Xush kelibsiz!\n"
+        "🕵️ Bu bot sizga yozishmada yordam berish uchun yaratilgan.\n\n"
+        "<b>Bot imkoniyatlari:</b>\n"
+        "• Suhbatdoshingiz xabarni o‘zgartirsa yoki o‘chirsa, darhol bildirishioma yuboradi 🔔\n"
+        "• Suhbatdoshingiz yuboradigan bir martalik (taymerli) foto yoki videoni yuklab oladi 🥷\n"
+        "• Barcha chatlaringiz saqlanadi (o‘chirilganlari ham)\n\n"
+        "<b>? Botni ulash:</b>\n"
+        "1. «🟢 Ulash» tugmasini bosing\n"
+        "2. «Chatlarni avtomatlashtirish»ni tanlang va kiritish maydoniga yozing:\n"
+        f"@{BOT_USERNAME}\n"
+    )
+    await msg.answer(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data == "how_it_works")
+async def how_it_works(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(
+        "Bot qanday ishlaydi:\n\n"
+        "1. Botni Telegram Business orqali ulang\n"
+        "2. Kerakli chatlarni tanlang\n"
+        "3. Suhbatdoshingiz xabarni o‘zgartirsa yoki o‘chirsa — sizga bildirishnoma keladi\n"
+        "4. Bir martalik (view-once) media ham saqlanadi\n"
+        "5. Barcha chatlar saqlanadi, o‘chirilganlarini «O‘chirilgan chatlarim» dan ko‘rasiz\n"
+        "6. Har bir chat uchun o‘chirish yoki 6/24 soatlik taymer qo‘yish mumkin"
+    )
+
+@dp.callback_query(F.data == "deleted_chats")
+async def show_deleted_chats(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+
+    # muddati o‘tganlarni o‘chirish
+    await clean_expired_chats()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT connection_id FROM connections WHERE user_id=?", (user_id,)
+        ) as cursor:
+            connections = await cursor.fetchall()
+
+        if not connections:
+            await callback.message.answer("❌ Siz botni hali ulamagansiz.")
+            return
+
+        buttons = []
+        for (conn_id,) in connections:
+            async with db.execute(
+                "SELECT chat_id, chat_title, delete_at FROM chats WHERE connection_id=? ORDER BY last_activity DESC",
+                (conn_id,)
+            ) as cursor:
+                chats = await cursor.fetchall()
+                for chat_id, chat_title, delete_at in chats:
+                    title = chat_title or f"Chat {chat_id}"
+                    if delete_at:
+                        title += " ⏳"
+                    buttons.append([
+                        InlineKeyboardButton(
+                            text=f"👤 {title}",
+                            callback_data=f"open_chat:{conn_id}:{chat_id}"
+                        )
+                    ])
+
+        if not buttons:
+            await callback.message.answer("🗑 Hozircha saqlangan chatlar yo‘q.")
+            return
+
+        buttons.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back_to_start")])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await callback.message.answer("🗑 Saqlangan chatlaringiz:", reply_markup=keyboard)
+
+@dp.callback_query(F.data.startswith("open_chat:"))
+async def open_deleted_chat(callback: CallbackQuery):
+    await callback.answer()
+    _, conn_id, chat_id = callback.data.split(":")
+    chat_id = int(chat_id)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """SELECT text, from_user_name, date 
+               FROM messages 
+               WHERE connection_id=? AND chat_id=? AND text IS NOT NULL AND text != ''
+               ORDER BY message_id ASC""",
+            (conn_id, chat_id)
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    if not rows:
+        await callback.message.answer("Bu chatda saqlangan text yo‘q.")
+        return
+
+    text_parts = []
+    current = ""
+    for text, name, date in rows:
+        line = f"<b>{name or 'Noma\'lum'}</b> [{date or ''}]:\n{text}\n\n"
+        if len(current) + len(line) > 4000:
+            text_parts.append(current)
+            current = line
+        else:
+            current += line
+    if current:
+        text_parts.append(current)
+
+    for part in text_parts:
+        await callback.message.answer(part, parse_mode=ParseMode.HTML)
+
+    # boshqaruv tugmalari
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🗑 O‘chirish", callback_data=f"delete_now:{conn_id}:{chat_id}"),
+            InlineKeyboardButton(text="⏳ Taymer", callback_data=f"set_timer:{conn_id}:{chat_id}")
+        ],
+        [InlineKeyboardButton(text="⬅️ Chatlarga qaytish", callback_data="deleted_chats")]
+    ])
+    await callback.message.answer("⬆️ Yuqorida chat tarixi", reply_markup=keyboard)
+
+@dp.callback_query(F.data.startswith("set_timer:"))
+async def set_timer_menu(callback: CallbackQuery):
+    await callback.answer()
+    _, conn_id, chat_id = callback.data.split(":")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="6 soat", callback_data=f"timer_6:{conn_id}:{chat_id}"),
+            InlineKeyboardButton(text="24 soat", callback_data=f"timer_24:{conn_id}:{chat_id}")
+        ],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"open_chat:{conn_id}:{chat_id}")]
+    ])
+    await callback.message.answer("Taymer tanlang:", reply_markup=keyboard)
+
+@dp.callback_query(F.data.startswith("timer_6:"))
+async def timer_6(callback: CallbackQuery):
+    await callback.answer("6 soatlik taymer qo‘yildi")
+    _, conn_id, chat_id = callback.data.split(":")
+    delete_at = (datetime.now() + timedelta(hours=6)).strftime("%Y-%m-%d %H:%M")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE chats SET delete_at=? WHERE connection_id=? AND chat_id=?",
+            (delete_at, conn_id, int(chat_id))
+        )
+        await db.commit()
+    await callback.message.answer(f"✅ 6 soatdan keyin o‘chiriladi ({delete_at})")
+
+@dp.callback_query(F.data.startswith("timer_24:"))
+async def timer_24(callback: CallbackQuery):
+    await callback.answer("24 soatlik taymer qo‘yildi")
+    _, conn_id, chat_id = callback.data.split(":")
+    delete_at = (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE chats SET delete_at=? WHERE connection_id=? AND chat_id=?",
+            (delete_at, conn_id, int(chat_id))
+        )
+        await db.commit()
+    await callback.message.answer(f"✅ 24 soatdan keyin o‘chiriladi ({delete_at})")
+
+@dp.callback_query(F.data.startswith("delete_now:"))
+async def delete_now(callback: CallbackQuery):
+    await callback.answer("O‘chirildi")
+    _, conn_id, chat_id = callback.data.split(":")
+    chat_id = int(chat_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM messages WHERE connection_id=? AND chat_id=?", (conn_id, chat_id))
+        await db.execute("DELETE FROM chats WHERE connection_id=? AND chat_id=?", (conn_id, chat_id))
+        await db.commit()
+    await callback.message.answer("🗑 Chat tarixi o‘chirildi.")
+
+@dp.callback_query(F.data == "back_to_start")
+async def back_to_start(callback: CallbackQuery):
+    await callback.answer()
+    await start(callback.message)
+
+async def clean_expired_chats():
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT connection_id, chat_id FROM chats WHERE delete_at IS NOT NULL AND delete_at <= ?",
+            (now,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+        for conn_id, chat_id in rows:
+            await db.execute("DELETE FROM messages WHERE connection_id=? AND chat_id=?", (conn_id, chat_id))
+            await db.execute("DELETE FROM chats WHERE connection_id=? AND chat_id=?", (conn_id, chat_id))
+        await db.commit()
+
+@dp.business_connection()
+async def on_business_connection(event: BusinessConnection):
+    async with aiosqlite.connect(DB_PATH) as db:
+        if event.is_enabled:
+            await db.execute(
+                "INSERT OR REPLACE INTO connections (connection_id, user_id) VALUES (?, ?)",
+                (event.id, event.user.id)
+            )
+            await db.commit()
+            await bot.send_message(
+                event.user.id,
+                f"✅ Bot muvaffaqiyatli ulandi!\nConnection ID: `{event.id}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await db.execute("DELETE FROM connections WHERE connection_id = ?", (event.id,))
+            await db.commit()
+            await bot.send_message(event.user.id, "❌ Bot uzildi.")
+
+@dp.business_message()
+async def on_business_message(msg: Message):
+    conn_id = msg.business_connection_id
+    if not conn_id:
+        return
+
+    text = msg.text or msg.caption or ""
+    file_id = None
+    file_type = None
+    from_user_id = msg.from_user.id if msg.from_user else None
+    from_user_name = msg.from_user.full_name if msg.from_user else "Noma'lum"
+    date = datetime.now().strftime("%Y-%m-%d %H:%M")
+    chat_title = getattr(msg.chat, 'full_name', None) or getattr(msg.chat, 'title', None) or str(msg.chat.id)
+
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+        file_type = "photo"
+    elif msg.video:
+        file_id = msg.video.file_id
+        file_type = "video"
+    elif msg.video_note:
+        file_id = msg.video_note.file_id
+        file_type = "video_note"
+    elif msg.document:
+        file_id = msg.document.file_id
+        file_type = "document"
+    elif msg.voice:
+        file_id = msg.voice.file_id
+        file_type = "voice"
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT OR REPLACE INTO messages 
+               (connection_id, chat_id, message_id, text, file_id, file_type, from_user_id, from_user_name, date) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (conn_id, msg.chat.id, msg.message_id, text, file_id, file_type, from_user_id, from_user_name, date)
+        )
+        await db.execute(
+            """INSERT OR REPLACE INTO chats (connection_id, chat_id, chat_title, last_activity, delete_at) 
+               VALUES (?, ?, ?, ?, NULL)""",
+            (conn_id, msg.chat.id, chat_title, date)
+        )
+        await db.commit()
+
+    if msg.reply_to_message:
+        replied = msg.reply_to_message
+        media_file_id = None
+        media_type = None
+        filename = "media.bin"
+
+        if replied.photo:
+            media_file_id = replied.photo[-1].file_id
+            media_type = "photo"
+            filename = "photo.jpg"
+        elif replied.video:
+            media_file_id = replied.video.file_id
+            media_type = "video"
+            filename = "video.mp4"
+        elif replied.video_note:
+            media_file_id = replied.video_note.file_id
+            media_type = "video_note"
+            filename = "video_note.mp4"
+        elif replied.document:
+            media_file_id = replied.document.file_id
+            media_type = "document"
+            filename = replied.document.file_name or "document.bin"
+        elif replied.voice:
+            media_file_id = replied.voice.file_id
+            media_type = "voice"
+            filename = "voice.ogg"
+
+        if media_file_id:
+            owner = await get_owner(conn_id)
+            if owner:
+                caption = f"👁 View-once / bir martalik media saqlandi\nChat ID: `{msg.chat.id}`"
+                try:
+                    file = await bot.get_file(media_file_id)
+                    downloaded = await bot.download_file(file.file_path)
+                    data = downloaded.read()
+                    input_file = BufferedInputFile(data, filename=filename)
+
+                    if media_type == "photo":
+                        await bot.send_photo(owner, photo=input_file, caption=caption, parse_mode=ParseMode.MARKDOWN)
+                    elif media_type == "video":
+                        await bot.send_video(owner, video=input_file, caption=caption, parse_mode=ParseMode.MARKDOWN)
+                    elif media_type == "video_note":
+                        await bot.send_video_note(owner, video_note=input_file)
+                        await bot.send_message(owner, caption, parse_mode=ParseMode.MARKDOWN)
+                    elif media_type == "voice":
+                        await bot.send_voice(owner, voice=input_file, caption=caption, parse_mode=ParseMode.MARKDOWN)
+                    else:
+                        await bot.send_document(owner, document=input_file, caption=caption, parse_mode=ParseMode.MARKDOWN)
+                except Exception as e:
+                    logging.error(f"Media yuborish xatosi: {e}")
+                    await bot.send_message(owner, f"Media yuklab bo‘lmadi: {e}")
+
+@dp.edited_business_message()
+async def on_edited(msg: Message):
+    conn_id = msg.business_connection_id
+    if not conn_id:
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT text FROM messages WHERE connection_id=? AND chat_id=? AND message_id=?",
+            (conn_id, msg.chat.id, msg.message_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        old_text = row[0] if row else "—"
+        new_text = msg.text or msg.caption or ""
+
+        await db.execute(
+            "UPDATE messages SET text=? WHERE connection_id=? AND chat_id=? AND message_id=?",
+            (new_text, conn_id, msg.chat.id, msg.message_id)
+        )
+        await db.commit()
+
+    owner = await get_owner(conn_id)
+    if owner and old_text != new_text:
+        await bot.send_message(
+            owner,
+            f"✏️ **Xabar o‘zgartirildi**\n\n"
+            f"**Eski:**\n`{old_text}`\n\n"
+            f"**Yangi:**\n`{new_text}`\n\n"
+            f"Chat ID: `{msg.chat.id}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+@dp.deleted_business_messages()
+async def on_deleted(event: BusinessMessagesDeleted):
+    conn_id = event.business_connection_id
+    owner = await get_owner(conn_id)
+    if not owner:
+        return
+
+    chat_id = event.chat.id
+    chat_title = getattr(event.chat, 'full_name', None) or getattr(event.chat, 'title', None) or str(chat_id)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT OR REPLACE INTO chats (connection_id, chat_id, chat_title, last_activity, delete_at) 
+               VALUES (?, ?, ?, ?, NULL)""",
+            (conn_id, chat_id, chat_title, datetime.now().strftime("%Y-%m-%d %H:%M"))
+        )
+
+        for msg_id in event.message_ids:
+            async with db.execute(
+                "SELECT text, file_id, file_type, from_user_name FROM messages WHERE connection_id=? AND chat_id=? AND message_id=?",
+                (conn_id, chat_id, msg_id)
+            ) as cursor:
+                row = await cursor.fetchone()
+
+            if row:
+                text, file_id, file_type, from_name = row
+                caption = f"🗑 **Xabar o‘chirildi**\n\n`{text or 'Media'}`\n\nChat ID: `{chat_id}`"
+
+                if file_id:
+                    try:
+                        file = await bot.get_file(file_id)
+                        downloaded = await bot.download_file(file.file_path)
+                        data = downloaded.read()
+
+                        filename = "media.bin"
+                        if file_type == "photo":
+                            filename = "photo.jpg"
+                        elif file_type == "video":
+                            filename = "video.mp4"
+                        elif file_type == "video_note":
+                            filename = "video_note.mp4"
+                        elif file_type == "voice":
+                            filename = "voice.ogg"
+
+                        input_file = BufferedInputFile(data, filename=filename)
+
+                        if file_type == "photo":
+                            await bot.send_photo(owner, photo=input_file, caption=caption, parse_mode=ParseMode.MARKDOWN)
+                        elif file_type == "video":
+                            await bot.send_video(owner, video=input_file, caption=caption, parse_mode=ParseMode.MARKDOWN)
+                        elif file_type == "video_note":
+                            await bot.send_video_note(owner, video_note=input_file)
+                            await bot.send_message(owner, caption, parse_mode=ParseMode.MARKDOWN)
+                        elif file_type == "voice":
+                            await bot.send_voice(owner, voice=input_file, caption=caption, parse_mode=ParseMode.MARKDOWN)
+                        else:
+                            await bot.send_document(owner, document=input_file, caption=caption, parse_mode=ParseMode.MARKDOWN)
+                    except Exception as e:
+                        await bot.send_message(owner, f"{caption}\n\nMedia yuklab bo‘lmadi: {e}", parse_mode=ParseMode.MARKDOWN)
+                else:
+                    await bot.send_message(owner, caption, parse_mode=ParseMode.MARKDOWN)
+
+        await db.commit()
+
+async def get_owner(connection_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id FROM connections WHERE connection_id=?", (connection_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+async def main():
+    await init_db()
+    logging.basicConfig(level=logging.INFO)
+    print("Business Spy Bot ishga tushdi...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
